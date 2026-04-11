@@ -1,0 +1,958 @@
+/*
+ * ============================================================
+ *  Secure Real-Time Voting System
+ *  QNX Neutrino RTOS — Team Genz Coders
+ * ============================================================
+ *  Build:
+ *    qcc -o voting_system voting.c -lpthread
+ *
+ *  Open in 2 more terminals:
+ *    cat /tmp/vt_live
+ *    cat /tmp/vt_admin
+ *
+ *  FIX: check_rate_limit() moved to AFTER successful vote
+ *       (was before voter ID input — caused infinite loop)
+ *  CHANGE: Rate-limit block reduced to 10 s with live
+ *          countdown bar printed on console.
+ * ============================================================
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <unistd.h>
+#include <time.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/neutrino.h>
+#include <errno.h>
+
+/* ── Constants ──────────────────────────────────────────── */
+#define MAX_VOTERS          20
+#define MAX_CANDIDATES      10
+#define VOTING_DURATION_SEC 1200
+#define ADMIN_PASSWORD      "arsh123"
+#define RATE_LIMIT_VOTES    3
+#define RATE_LIMIT_WINDOW   60
+#define RATE_LIMIT_BLOCK    10      /* ← changed: 30 → 10 seconds */
+
+/* ── Pipes ──────────────────────────────────────────────── */
+#define PIPE_ADMIN  "/tmp/vt_admin"
+#define PIPE_LIVE   "/tmp/vt_live"
+
+/* ── Message types ──────────────────────────────────────── */
+#define MSG_VOTE  1
+#define MSG_STOP  2
+
+/* ── Block reasons ──────────────────────────────────────── */
+#define BLOCK_NONE           0
+#define BLOCK_UNKNOWN_VOTER  1
+#define BLOCK_ALREADY_VOTED  2
+#define BLOCK_BAD_CANDIDATE  3
+#define BLOCK_FACE_FAIL      5
+
+static const char *block_reason_str(int reason)
+{
+    switch (reason) {
+    case BLOCK_UNKNOWN_VOTER:  return "Voter not found in database";
+    case BLOCK_ALREADY_VOTED:  return "Voter has already cast their vote";
+    case BLOCK_BAD_CANDIDATE:  return "Selected candidate number is invalid";
+    case BLOCK_FACE_FAIL:      return "Face verification failed";
+    default:                   return "Unknown reason";
+    }
+}
+
+/* ── Message structs ────────────────────────────────────── */
+typedef struct {
+    int type;
+    int voter_idx;
+    int candidate_idx;
+} vote_msg_t;
+
+typedef struct {
+    int ok;
+    int block_reason;
+} vote_reply_t;
+
+/* ── Data models ────────────────────────────────────────── */
+typedef struct {
+    int  voter_id;
+    char name[30];
+    int  has_voted;
+} voter_t;
+
+typedef struct {
+    char name[50];
+    int  votes;
+} candidate_t;
+
+/* ── Global state ───────────────────────────────────────── */
+static voter_t      voter_db[MAX_VOTERS];
+static int          voter_count     = 0;
+static candidate_t  candidates[MAX_CANDIDATES];
+static int          candidate_count = 0;
+static int          total_votes     = 0;
+static volatile int voting_open     = 0;
+static volatile int time_left       = 0;
+static int          chid            = -1;
+
+/* ── Rate limiting state ────────────────────────────────── */
+static int    vote_count_minute = 0;
+static time_t window_start      = 0;
+
+/* ── Pipe fds ───────────────────────────────────────────── */
+static int fd_admin = -1;
+static int fd_live  = -1;
+
+static FILE           *log_fp = NULL;
+static pthread_mutex_t vote_mutex;
+static pthread_mutex_t log_mutex;
+static pthread_mutex_t pipe_mutex;
+static pthread_mutex_t auth_mutex;
+static pthread_mutex_t rate_mutex;
+
+/* ── Prototypes ─────────────────────────────────────────── */
+void *counter_task(void *arg);
+void *timer_task(void *arg);
+static void print_results(void);
+static void send_stop(void);
+static void admin_menu(void);
+static void broadcast_live(void);
+static void door_open(void);
+static void door_closed(void);
+
+/* ── Priority-inherit mutex ─────────────────────────────── */
+static void make_mutex(pthread_mutex_t *m)
+{
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_setprotocol(&a, PTHREAD_PRIO_INHERIT);
+    pthread_mutex_init(m, &a);
+    pthread_mutexattr_destroy(&a);
+}
+
+/* ── Pipe write helpers ─────────────────────────────────── */
+static void pipe_write(int fd, const char *msg)
+{
+    if (fd < 0) return;
+    pthread_mutex_lock(&pipe_mutex);
+    ssize_t r = write(fd, msg, strlen(msg));
+    (void)r;
+    pthread_mutex_unlock(&pipe_mutex);
+}
+
+static void pipe_writef(int fd, const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    pipe_write(fd, buf);
+}
+
+/* ── Pipe setup ─────────────────────────────────────────── */
+static void setup_pipes(void)
+{
+    const char *pipes[] = {PIPE_ADMIN, PIPE_LIVE};
+    int i;
+    for (i = 0; i < 2; i++) {
+        unlink(pipes[i]);
+        mkfifo(pipes[i], 0666);
+    }
+    fd_admin = open(PIPE_ADMIN, O_RDWR | O_NONBLOCK);
+    fd_live  = open(PIPE_LIVE,  O_RDWR | O_NONBLOCK);
+
+    if (fd_admin < 0 || fd_live < 0)
+        printf("[WARNING] One or more pipes failed.\n");
+}
+
+/* ── Audit log ──────────────────────────────────────────── */
+static void audit(const char *event, int voter_id,
+                  const char *candidate)
+{
+    if (!log_fp) return;
+    time_t now = time(NULL);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S",
+             localtime(&now));
+    pthread_mutex_lock(&log_mutex);
+    fprintf(log_fp,
+            "[%s] EVENT=%-25s VOTER=%d CANDIDATE=%s\n",
+            ts, event, voter_id,
+            candidate ? candidate : "-");
+    fflush(log_fp);
+    pthread_mutex_unlock(&log_mutex);
+}
+
+/* ── Live dashboard (pipe only) ─────────────────────────── */
+static void broadcast_live(void)
+{
+    char buf[1024];
+    char ts[32];
+    time_t now = time(NULL);
+    int i, tv, tl;
+
+    pthread_mutex_lock(&vote_mutex);
+    tv = total_votes;
+    tl = time_left;
+    pthread_mutex_unlock(&vote_mutex);
+
+    strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&now));
+
+    snprintf(buf, sizeof(buf),
+        "\033[2J\033[H"
+        "╔══════════════════════════════╗\n"
+        "║   LIVE VOTING DASHBOARD      ║\n"
+        "╠══════════════════════════════╣\n"
+        "║  Total Voted : %-4d          ║\n"
+        "║  Time Left   : %-4d sec      ║\n"
+        "║  Last update : %s            ║\n"
+        "╠══════════════════════════════╣\n",
+        tv, tl, ts);
+
+    for (i = 0; i < candidate_count; i++) {
+        char line[64];
+        int pct = tv > 0
+                  ? candidates[i].votes * 100 / tv : 0;
+        snprintf(line, sizeof(line),
+                 "║  %-15s : %3d (%2d%%)  ║\n",
+                 candidates[i].name,
+                 candidates[i].votes, pct);
+        strncat(buf, line, sizeof(buf) - strlen(buf) - 1);
+    }
+    strncat(buf, "╚══════════════════════════════╝\n",
+            sizeof(buf) - strlen(buf) - 1);
+    pipe_write(fd_live, buf);
+}
+
+/* ── Door messages ──────────────────────────────────────── */
+static void door_closed(void)
+{
+    printf("┌─────────────────────────────────────────┐\n");
+    printf("│     >>> DOOR CLOSED  YOU CAN VOTE <<<   │\n");
+    printf("└─────────────────────────────────────────┘\n\n");
+    pipe_write(fd_admin, "[DOOR] Door CLOSED - voter inside.\n");
+}
+
+static void door_open(void)
+{
+    printf("┌───────────────────────────────────┐\n");
+    printf("│   >>> DOOR OPEN  VOTE CASTED <<<  │\n");
+    printf("└───────────────────────────────────┘\n\n");
+    pipe_write(fd_admin, "[DOOR] Door OPEN - voter exited.\n");
+}
+
+/* ══════════════════════════════════════════════════════════
+   COUNTER TASK — HIGH priority 25
+   ══════════════════════════════════════════════════════════ */
+void *counter_task(void *arg)
+{
+    (void)arg;
+    struct sched_param sp = { .sched_priority = 25 };
+    pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+
+    vote_msg_t   msg;
+    vote_reply_t rep;
+    int rcvid;
+
+    while (1) {
+        rcvid = MsgReceive(chid, &msg, sizeof(msg), NULL);
+        if (rcvid <= 0) continue;
+
+        if (msg.type == MSG_STOP) {
+            rep.ok = 0;
+            rep.block_reason = BLOCK_NONE;
+            MsgReply(rcvid, 0, &rep, sizeof(rep));
+            break;
+        }
+
+        pthread_mutex_lock(&vote_mutex);
+
+        int vidx    = msg.voter_idx;
+        int cidx    = msg.candidate_idx;
+        int ok      = 0;
+        int breason = BLOCK_NONE;
+        char voter_name[30] = {0};
+        char cand_name[50]  = {0};
+
+        if (vidx < 0 || vidx >= voter_count) {
+            breason = BLOCK_UNKNOWN_VOTER;
+        } else if (voter_db[vidx].has_voted) {
+            breason = BLOCK_ALREADY_VOTED;
+            strncpy(voter_name, voter_db[vidx].name, 29);
+            audit("DUPLICATE_VOTE",
+                  voter_db[vidx].voter_id, NULL);
+        } else if (cidx < 0 || cidx >= candidate_count) {
+            breason = BLOCK_BAD_CANDIDATE;
+        } else {
+            voter_db[vidx].has_voted = 1;
+            candidates[cidx].votes++;
+            total_votes++;
+            ok = 1;
+            strncpy(voter_name, voter_db[vidx].name, 29);
+            strncpy(cand_name,  candidates[cidx].name, 49);
+            audit("VOTE_CAST",
+                  voter_db[vidx].voter_id, cand_name);
+        }
+
+        pthread_mutex_unlock(&vote_mutex);
+
+        rep.ok = ok;
+        rep.block_reason = breason;
+        MsgReply(rcvid, ok, &rep, sizeof(rep));
+
+        if (ok) {
+            pipe_writef(fd_admin,
+                "[INFO] Vote counted: Voter=%s\n",
+                voter_name);
+            broadcast_live();
+        } else {
+            pipe_writef(fd_admin,
+                "[ALERT] Vote BLOCKED - %s\n",
+                block_reason_str(breason));
+        }
+    }
+    return NULL;
+}
+
+/* ══════════════════════════════════════════════════════════
+   TIMER TASK — priority 10 (silent, pipe only)
+   ══════════════════════════════════════════════════════════ */
+void *timer_task(void *arg)
+{
+    (void)arg;
+    struct sched_param sp = { .sched_priority = 10 };
+    pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+
+    int i;
+    for (i = VOTING_DURATION_SEC; i > 0 && voting_open; i--) {
+        time_left = i;
+        broadcast_live();
+        sleep(1);
+    }
+    if (voting_open) {
+        voting_open = 0;
+        printf("\n[TIMER] Voting time expired!\n");
+        pipe_write(fd_admin,
+            "[ALERT] Voting expired. Polls closed.\n");
+    }
+    return NULL;
+}
+
+/* ── Print final results ────────────────────────────────── */
+static void print_results(void)
+{
+    int i;
+    pthread_mutex_lock(&vote_mutex);
+    int total  = total_votes;
+    int winner = 0;
+    for (i = 1; i < candidate_count; i++)
+        if (candidates[i].votes > candidates[winner].votes)
+            winner = i;
+
+    printf("\n╔══════════════════════════════════╗\n");
+    printf("║         FINAL RESULTS            ║\n");
+    printf("╠══════════════════════════════════╣\n");
+    for (i = 0; i < candidate_count; i++) {
+        int pct = total > 0
+                  ? candidates[i].votes * 100 / total : 0;
+        printf("║  %-15s : %3d votes %2d%% ║\n",
+               candidates[i].name,
+               candidates[i].votes, pct);
+    }
+    printf("╠══════════════════════════════════╣\n");
+    printf("║  Total Votes : %-4d              ║\n", total);
+    if (total > 0)
+        printf("║  WINNER      : %-15s     ║\n",
+               candidates[winner].name);
+    printf("╚══════════════════════════════════╝\n");
+
+    pipe_writef(fd_admin, "\n=== FINAL RESULTS ===\n");
+    for (i = 0; i < candidate_count; i++)
+        pipe_writef(fd_admin, "%s : %d votes\n",
+                    candidates[i].name,
+                    candidates[i].votes);
+    if (total > 0)
+        pipe_writef(fd_admin, "WINNER: %s\n",
+                    candidates[winner].name);
+
+    pthread_mutex_unlock(&vote_mutex);
+}
+
+/* ── Send stop to counter ───────────────────────────────── */
+static void send_stop(void)
+{
+    int coid = ConnectAttach(0, getpid(), chid,
+                             _NTO_SIDE_CHANNEL, 0);
+    if (coid == -1) return;
+    vote_msg_t   msg = { .type = MSG_STOP };
+    vote_reply_t rep = {0};
+    MsgSend(coid, &msg, sizeof(msg), &rep, sizeof(rep));
+    ConnectDetach(coid);
+}
+
+/* ── Admin menu ─────────────────────────────────────────── */
+static void admin_menu(void)
+{
+    int running = 1;
+    int choice, i;
+
+    while (running) {
+        printf("\n╔══════════════════════════════╗\n");
+        printf("║         ADMIN MENU           ║\n");
+        printf("╠══════════════════════════════╣\n");
+        printf("║  1. Add candidate            ║\n");
+        printf("║  2. Remove candidate         ║\n");
+        printf("║  3. View results             ║\n");
+        printf("║  4. Start voting             ║\n");
+        printf("║  5. Live vote count          ║\n");
+        printf("║  6. Quit                     ║\n");
+        printf("╚══════════════════════════════╝\n");
+        printf("Choice: ");
+        fflush(stdout);
+
+        choice = 0;
+        if (scanf("%d", &choice) != 1) {
+            int c;
+            while ((c = getchar()) != '\n' && c != EOF);
+            continue;
+        }
+        { int c; while ((c = getchar()) != '\n' && c != EOF); }
+
+        switch (choice) {
+
+        case 1:
+            if (candidate_count >= MAX_CANDIDATES) {
+                printf("[ADMIN] Max candidates reached.\n");
+                break;
+            }
+            printf("Enter candidate name: ");
+            fflush(stdout);
+            if (fgets(candidates[candidate_count].name,
+                      50, stdin)) {
+                candidates[candidate_count].name[
+                    strcspn(candidates[candidate_count].name,
+                            "\n")] = '\0';
+                candidates[candidate_count].votes = 0;
+                candidate_count++;
+                printf("[ADMIN] '%s' added (%d total)\n",
+                       candidates[candidate_count - 1].name,
+                       candidate_count);
+            }
+            break;
+
+        case 2: {
+            int rem = 0;
+            if (candidate_count == 0) {
+                printf("No candidates.\n"); break;
+            }
+            for (i = 0; i < candidate_count; i++)
+                printf("  %d. %s\n", i + 1,
+                       candidates[i].name);
+            printf("Remove number: ");
+            fflush(stdout);
+            if (scanf("%d", &rem) == 1 &&
+                rem >= 1 && rem <= candidate_count) {
+                printf("[ADMIN] Removed '%s'\n",
+                       candidates[rem - 1].name);
+                for (i = rem - 1;
+                     i < candidate_count - 1; i++)
+                    candidates[i] = candidates[i + 1];
+                candidate_count--;
+            }
+            { int c;
+              while ((c = getchar()) != '\n'
+                     && c != EOF); }
+            break;
+        }
+
+        case 3:
+            print_results();
+            break;
+
+        case 4:
+            if (candidate_count == 0) {
+                printf("[ADMIN] Add candidates first!\n");
+                break;
+            }
+            running = 0;
+            break;
+
+        case 5:
+            printf("[LIVE] %d / %d voted\n",
+                   total_votes, voter_count);
+            for (i = 0; i < candidate_count; i++) {
+                int pct = total_votes > 0
+                    ? candidates[i].votes * 100
+                      / total_votes : 0;
+                printf("  %-20s : %d (%d%%)\n",
+                       candidates[i].name,
+                       candidates[i].votes, pct);
+            }
+            break;
+
+        case 6:
+            running     = 0;
+            voting_open = 0;
+            break;
+
+        default:
+            printf("Invalid option.\n");
+        }
+    }
+}
+
+/* ── Voter registration ─────────────────────────────────── */
+static void register_voters(void)
+{
+    int i;
+    const char *names[] = {
+        "Arsh","kratika","Anushree","Diana","Gohar",
+        "kvsss","ravindra","chandra","Alish","kumar",
+        "Anupama","Dim","rahul","virat",
+        "siddaramayiya","kumarswami","ravikiran"
+    };
+    voter_count = 17;
+    for (i = 0; i < voter_count; i++) {
+        voter_db[i].voter_id  = 100 + i + 1;
+        voter_db[i].has_voted = 0;
+        strncpy(voter_db[i].name, names[i], 29);
+        voter_db[i].name[29] = '\0';
+    }
+    printf("[SYSTEM] %d voters registered."
+           " IDs: 101 to 117\n", voter_count);
+}
+
+/* ══════════════════════════════════════════════════════════
+   RATE LIMITER
+   Called AFTER a successful vote is cast.
+   Locks for RATE_LIMIT_BLOCK (10) seconds and shows a
+   live countdown bar on the console each second.
+   ══════════════════════════════════════════════════════════ */
+static void check_rate_limit(void)
+{
+    pthread_mutex_lock(&rate_mutex);
+    time_t now = time(NULL);
+
+    /* Reset window if 60 seconds have passed */
+    if (now - window_start >= RATE_LIMIT_WINDOW) {
+        vote_count_minute = 0;
+        window_start      = now;
+    }
+
+    vote_count_minute++;
+
+    if (vote_count_minute > RATE_LIMIT_VOTES) {
+        pthread_mutex_unlock(&rate_mutex);
+
+        /* ── Lockout banner ── */
+        printf("\n");
+        printf("╔══════════════════════════════════════════╗\n");
+        printf("║   RATE LIMIT REACHED — SYSTEM LOCKED    ║\n");
+        printf("║   %d votes cast within %d seconds        ║\n",
+               RATE_LIMIT_VOTES, RATE_LIMIT_WINDOW);
+        printf("║   Booth locked for %2d seconds            ║\n",
+               RATE_LIMIT_BLOCK);
+        printf("╠══════════════════════════════════════════╣\n");
+
+        pipe_writef(fd_admin,
+            "[ALERT] Rate limit hit. Booth locked %ds.\n",
+            RATE_LIMIT_BLOCK);
+
+        /* ── Compact countdown — all on one line: 10 9 8 … 0 ── */
+        int i;
+        printf("  Resuming in: ");
+        fflush(stdout);
+        for (i = RATE_LIMIT_BLOCK; i >= 0; i--) {
+            printf("%d ", i);
+            fflush(stdout);
+            if (i > 0) sleep(1);
+        }
+        printf("\n");
+
+        printf("╚══════════════════════════════════════════╝\n");
+        printf("[SYSTEM] Lockout cleared. Voting resumed.\n\n");
+
+        pipe_write(fd_admin,
+            "[INFO] Rate-limit pause ended. Resumed.\n");
+
+        /* Reset counters */
+        pthread_mutex_lock(&rate_mutex);
+        vote_count_minute = 0;
+        window_start      = time(NULL);
+    }
+
+    pthread_mutex_unlock(&rate_mutex);
+}
+
+/* ── Fraud lockdown — admin must unlock ─────────────────── */
+static void fraud_lockdown(int voter_id,
+                           const char *voter_name)
+{
+    printf("\n");
+    printf("╔══════════════════════════════════════╗\n");
+    printf("║   FRAUD DETECTED - SYSTEM LOCKED     ║\n");
+    printf("╚══════════════════════════════════════╝\n");
+    printf("  Voter %d (%s) has already voted!\n\n",
+           voter_id, voter_name);
+    pipe_writef(fd_admin,
+        "[FRAUD] Duplicate vote by ID %d (%s).\n",
+        voter_id, voter_name);
+    audit("FRAUD_LOCKDOWN", voter_id, NULL);
+
+    char admin_pwd[32];
+    while (1) {
+        printf("  ADMIN PASSWORD TO UNLOCK: ");
+        fflush(stdout);
+        if (scanf("%31s", admin_pwd) != 1) continue;
+        { int c;
+          while ((c = getchar()) != '\n'
+                 && c != EOF); }
+        if (strcmp(admin_pwd, ADMIN_PASSWORD) == 0)
+            break;
+        printf("  Wrong password. Try again.\n");
+    }
+    printf("[SYSTEM] Admin verified. Resuming.\n\n");
+    pipe_write(fd_admin,
+        "[INFO] Admin unlocked after fraud.\n");
+}
+
+/* ── Step 1: Voter ID ───────────────────────────────────── */
+static int step1_enter_voter_id(void)
+{
+    int voter_id = 0;
+
+    printf("╔════════════════════════════╗\n");
+    printf("║    ENTER YOUR VOTER ID     ║\n");
+    printf("╚════════════════════════════╝\n");
+    printf("  Voter IDs: 101 to 117\n");
+    printf("  Enter Voter ID: ");
+    fflush(stdout);
+
+    if (scanf("%d", &voter_id) != 1) {
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF);
+        printf("  [ERROR] Please enter a number.\n\n");
+        return -1;
+    }
+    { int c; while ((c = getchar()) != '\n' && c != EOF); }
+
+    int i, found = -1;
+    pthread_mutex_lock(&auth_mutex);
+    for (i = 0; i < voter_count; i++) {
+        if (voter_db[i].voter_id == voter_id) {
+            found = i; break;
+        }
+    }
+    pthread_mutex_unlock(&auth_mutex);
+
+    if (found == -1) {
+        printf("  Voter ID %d not found.\n\n", voter_id);
+        pipe_writef(fd_admin,
+            "[ALERT] Unknown Voter ID %d attempted.\n",
+            voter_id);
+        audit("UNKNOWN_VOTER", voter_id, NULL);
+        return -1;
+    }
+
+    pthread_mutex_lock(&vote_mutex);
+    int already = voter_db[found].has_voted;
+    char vname[30];
+    strncpy(vname, voter_db[found].name, 29);
+    pthread_mutex_unlock(&vote_mutex);
+
+    if (already) {
+        fraud_lockdown(voter_id, vname);
+        return -1;
+    }
+
+    printf("  Welcome %s!\n", voter_db[found].name);
+    return found;
+}
+
+/* ── Step 2: Face verification ──────────────────────────── */
+static int step2_face_verification(int voter_idx)
+{
+    int result = -1;
+
+    printf("\n");
+    printf("╔══════════════════════════════╗\n");
+    printf("║      FACE VERIFICATION       ║\n");
+    printf("╚══════════════════════════════╝\n");
+    printf("  Please look at the camera\n");
+    printf("  Face (1=Pass  0=Fail): ");
+    fflush(stdout);
+
+    if (scanf("%d", &result) != 1) {
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF);
+        result = 0;
+    } else {
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF);
+    }
+
+    if (result != 1) {
+        printf("  Face FAILED. Access DENIED.\n\n");
+        pipe_write(fd_admin,
+            "[ALERT] Face verification failed.\n");
+        audit("FACE_FAIL",
+              voter_db[voter_idx].voter_id, NULL);
+        return 0;
+    }
+
+    printf("  Face verified successfully.\n");
+    return 1;
+}
+
+/* ── Exit face verification ─────────────────────────────── */
+static int exit_face(int voter_idx)
+{
+    int result = -1;
+
+    printf("╔══════════════════════════════╗\n");
+    printf("║      EXIT VERIFICATION       ║\n");
+    printf("╚══════════════════════════════╝\n");
+    printf("  Look at the camera again\n");
+    printf("  Face (1=Pass  0=Fail): ");
+    fflush(stdout);
+
+    if (scanf("%d", &result) != 1) {
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF);
+        result = 0;
+    } else {
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF);
+    }
+
+    if (result != 1) {
+        printf("  Exit FAILED. Door remains CLOSED.\n\n");
+        pipe_write(fd_admin,
+            "[ALERT] Exit failed. Door locked.\n");
+        return 0;
+    }
+    printf("  Identity verified. Door opening.\n");
+    pipe_writef(fd_admin,
+        "[INFO] Exit passed for Voter ID %d.\n",
+        voter_db[voter_idx].voter_id);
+    return 1;
+}
+
+/* ══════════════════════════════════════════════════════════
+   MAIN
+   ══════════════════════════════════════════════════════════ */
+int main(void)
+{
+    int i;
+    struct sched_param sp = { .sched_priority = 5 };
+    pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+
+    srand((unsigned)time(NULL));
+
+    make_mutex(&vote_mutex);
+    make_mutex(&log_mutex);
+    make_mutex(&pipe_mutex);
+    make_mutex(&auth_mutex);
+    make_mutex(&rate_mutex);
+
+    window_start = time(NULL);
+
+    log_fp = fopen("/tmp/vote_audit.log", "w");
+    setup_pipes();
+
+    chid = ChannelCreate(0);
+    if (chid == -1) { perror("ChannelCreate"); return 1; }
+
+    printf("\n╔══════════════════════════════════════╗\n");
+    printf("║    Secure Real-Time Voting System    ║\n");
+    printf("║         By Team Genz Coders          ║\n");
+    printf("╚══════════════════════════════════════╝\n\n");
+
+    /* Admin login */
+    int attempts = 0;
+    while (1) {
+        char pwd[32];
+        printf("Admin password: ");
+        fflush(stdout);
+        if (scanf("%31s", pwd) != 1) continue;
+        { int c;
+          while ((c = getchar()) != '\n' && c != EOF); }
+        if (strcmp(pwd, ADMIN_PASSWORD) == 0) {
+            printf("[SYSTEM] Login successful!\n");
+            break;
+        }
+        if (++attempts >= 3) {
+            printf("[SYSTEM] Too many attempts. Locked: ");
+            fflush(stdout);
+            int t;
+            for (t = 30; t >= 0; t--) {
+                printf("%d ", t);
+                fflush(stdout);
+                if (t > 0) sleep(1);
+            }
+            printf("\n");
+            attempts = 0;
+        } else {
+            printf("[SYSTEM] Wrong password!\n");
+        }
+    }
+
+    register_voters();
+    admin_menu();
+
+    if (candidate_count == 0 || voter_count == 0)
+        goto cleanup;
+
+    voting_open = 1;
+    time_left   = VOTING_DURATION_SEC;
+
+    printf("\n[SYSTEM] Voting is now OPEN! (%d sec)\n\n",
+           VOTING_DURATION_SEC);
+    pipe_write(fd_admin, "[INFO] Voting session started.\n");
+    broadcast_live();
+
+    pthread_t counter_tid, timer_tid;
+    pthread_create(&counter_tid, NULL, counter_task, NULL);
+    pthread_create(&timer_tid,   NULL, timer_task,   NULL);
+
+    int coid = ConnectAttach(0, getpid(), chid,
+                             _NTO_SIDE_CHANNEL, 0);
+    if (coid == -1) { perror("ConnectAttach"); goto cleanup; }
+
+    /* ── Main voting loop ───────────────────────────────── */
+    while (voting_open) {
+
+        /* Step 1 — Voter ID */
+        int voter_idx = step1_enter_voter_id();
+        if (voter_idx == -1) continue;
+
+        /* Step 2 — Face scan */
+        if (!step2_face_verification(voter_idx)) continue;
+
+        /* Authenticated — close door */
+        door_closed();
+
+        /* Candidate selection */
+        printf("\n╔══════════════════════════════════╗\n");
+        printf("║        SELECT A CANDIDATE        ║\n");
+        printf("╠══════════════════════════════════╣\n");
+        for (i = 0; i < candidate_count; i++)
+            printf("║  %d. %-28s ║\n",
+                   i + 1, candidates[i].name);
+        printf("╚══════════════════════════════════╝\n");
+        printf("  Enter choice (1-%d): ", candidate_count);
+        fflush(stdout);
+
+        int choice = 0;
+        if (scanf("%d", &choice) != 1 ||
+            choice < 1 || choice > candidate_count) {
+            printf("  Invalid. Vote cancelled.\n\n");
+            int c;
+            while ((c = getchar()) != '\n' && c != EOF);
+            if (exit_face(voter_idx)) door_open();
+            else printf("  Exit failed - door locked.\n\n");
+            continue;
+        }
+        { int c; while ((c = getchar()) != '\n' && c != EOF); }
+
+        /* Send vote via QNX IPC MsgSend */
+        vote_msg_t vmsg = {
+            .type          = MSG_VOTE,
+            .voter_idx     = voter_idx,
+            .candidate_idx = choice - 1,
+        };
+        vote_reply_t vrep = {0};
+
+        if (MsgSend(coid, &vmsg, sizeof(vmsg),
+                    &vrep, sizeof(vrep)) == -1) {
+            perror("MsgSend");
+            if (exit_face(voter_idx)) door_open();
+            continue;
+        }
+
+        if (vrep.ok) {
+            printf("\n");
+            printf("╔══════════════════════════════╗\n");
+            printf("║   VOTE CASTED SUCCESSFULLY   ║\n");
+            printf("╚══════════════════════════════╝\n\n");
+
+            pthread_mutex_lock(&vote_mutex);
+            printf("  Total voted : %d / %d\n",
+                   total_votes, voter_count);
+            pthread_mutex_unlock(&vote_mutex);
+            printf("\n");
+
+            /* Rate limit checked HERE, after successful vote */
+            check_rate_limit();
+
+        } else {
+            printf("\n  [BLOCKED] %s\n\n",
+                   block_reason_str(vrep.block_reason));
+        }
+        fflush(stdout);
+
+        /* Exit verification */
+        if (exit_face(voter_idx))
+            door_open();
+        else {
+            printf("  Exit failed - door locked."
+                   " Admin alerted.\n\n");
+            pipe_write(fd_admin,
+                "[ALERT] Exit failed. Door locked.\n");
+            audit("EXIT_FAIL_LOCKED",
+                  voter_db[voter_idx].voter_id, NULL);
+        }
+
+        /* Admin end check */
+        if (voting_open) {
+            printf("  Type 'end' to stop voting or"
+                   " press Enter to continue: ");
+            fflush(stdout);
+            char cmd[16];
+            if (scanf("%15s", cmd) == 1 &&
+                strcmp(cmd, "end") == 0) {
+                printf("  Admin password: ");
+                fflush(stdout);
+                char apwd[32];
+                if (scanf("%31s", apwd) == 1 &&
+                    strcmp(apwd, ADMIN_PASSWORD) == 0) {
+                    voting_open = 0;
+                    printf("\n[ADMIN] Voting ended.\n");
+                } else {
+                    printf("  Wrong password."
+                           " Voting continues.\n\n");
+                }
+            }
+            { int c;
+              while ((c = getchar()) != '\n'
+                     && c != EOF); }
+        }
+    }
+
+    ConnectDetach(coid);
+    pthread_join(timer_tid, NULL);
+    send_stop();
+    pthread_join(counter_tid, NULL);
+
+    print_results();
+
+cleanup:
+    if (log_fp) {
+        fprintf(log_fp, "\n=== SESSION END ===\n");
+        fclose(log_fp);
+    }
+    pthread_mutex_destroy(&vote_mutex);
+    pthread_mutex_destroy(&log_mutex);
+    pthread_mutex_destroy(&pipe_mutex);
+    pthread_mutex_destroy(&auth_mutex);
+    pthread_mutex_destroy(&rate_mutex);
+    ChannelDestroy(chid);
+    if (fd_admin >= 0) close(fd_admin);
+    if (fd_live  >= 0) close(fd_live);
+    printf("\n[SYSTEM] Audit log: /tmp/vote_audit.log\n");
+    return 0;
+}
