@@ -2,6 +2,7 @@ Secure Real-Time Voting System
 QNX Neutrino RTOS
 Team Genz Coders
 
+
 A secure, real-time electronic voting booth built on QNX Neutrino RTOS using C. Designed for embedded systems where timing, integrity, and concurrency are critical. Everything runs on a single QNX console with no external terminals or pipes required.
 
 
